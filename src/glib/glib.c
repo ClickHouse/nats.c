@@ -64,7 +64,6 @@ _finalCleanup(void)
         ERR_free_strings();
         EVP_cleanup();
         CRYPTO_cleanup_all_ex_data();
-        ERR_remove_thread_state(0);
 #endif
         sk_SSL_COMP_free(SSL_COMP_get_compression_methods());
 #endif
