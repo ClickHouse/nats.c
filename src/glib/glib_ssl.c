@@ -15,11 +15,8 @@
 
 
 void
-nats_cleanupThreadSSL(void *localStorage)
+nats_cleanupThreadSSL(void *)
 {
-#if defined(NATS_HAS_TLS) && !defined(NATS_USE_OPENSSL_1_1)
-    ERR_remove_thread_state(0);
-#endif
 }
 
 void nats_sslRegisterThreadForCleanup(void)
