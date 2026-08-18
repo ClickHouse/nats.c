@@ -41,6 +41,8 @@ typedef struct __natsLibuvEvent
 {
     int                     type;
     bool                    add;
+    // Only meaningful for NATS_LIBUV_ATTACH.
+    natsSock                socket;
     struct __natsLibuvEvent *next;
 
 } natsLibuvEvent;
@@ -107,18 +109,9 @@ natsLibuv_SetThreadLocalLoop(uv_loop_t *loop)
 }
 
 static natsStatus
-uvScheduleToEventLoop(natsLibuvEvents *nle, int eventType, bool add)
+uvEnqueueEvent(natsLibuvEvents *nle, natsLibuvEvent *newEvent)
 {
-    natsLibuvEvent  *newEvent = NULL;
-    int             res;
-
-    newEvent = (natsLibuvEvent*) malloc(sizeof(natsLibuvEvent));
-    if (newEvent == NULL)
-        return NATS_NO_MEMORY;
-
-    newEvent->type  = eventType;
-    newEvent->add   = add;
-    newEvent->next  = NULL;
+    int res;
 
     uv_mutex_lock(nle->lock);
 
@@ -140,6 +133,50 @@ uvScheduleToEventLoop(natsLibuvEvents *nle, int eventType, bool add)
     uv_mutex_unlock(nle->lock);
 
     return (res == 0 ? NATS_OK : NATS_ERR);
+}
+
+static natsLibuvEvent*
+uvNewEvent(int eventType, bool add)
+{
+    // Zero-initialized so that `socket` has a defined value for the event
+    // types that do not carry one.
+    natsLibuvEvent *newEvent = (natsLibuvEvent*) calloc(1, sizeof(natsLibuvEvent));
+
+    if (newEvent == NULL)
+        return NULL;
+
+    newEvent->type = eventType;
+    newEvent->add  = add;
+    newEvent->next = NULL;
+
+    return newEvent;
+}
+
+static natsStatus
+uvScheduleToEventLoop(natsLibuvEvents *nle, int eventType, bool add)
+{
+    natsLibuvEvent *newEvent = uvNewEvent(eventType, add);
+
+    if (newEvent == NULL)
+        return NATS_NO_MEMORY;
+
+    return uvEnqueueEvent(nle, newEvent);
+}
+
+// The socket travels in the event so that `nle` is not written here. Callers
+// pass their own socket argument; reading `nle->socket` off the event loop
+// thread is not allowed.
+static natsStatus
+uvScheduleAttachToEventLoop(natsLibuvEvents *nle, natsSock socket)
+{
+    natsLibuvEvent *newEvent = uvNewEvent(NATS_LIBUV_ATTACH, true);
+
+    if (newEvent == NULL)
+        return NATS_NO_MEMORY;
+
+    newEvent->socket = socket;
+
+    return uvEnqueueEvent(nle, newEvent);
 }
 
 static void
@@ -204,10 +241,15 @@ uvPollUpdate(natsLibuvEvents *nle, int eventType, bool add)
     return NATS_OK;
 }
 
+// Runs on the event loop thread only, which is what makes `nle->socket` and
+// `nle->events` single-threaded.
 static natsStatus
-uvAsyncAttach(natsLibuvEvents *nle)
+uvAsyncAttach(natsLibuvEvents *nle, natsSock socket)
 {
     natsStatus  s = NATS_OK;
+
+    nle->socket = socket;
+    nle->events = UV_READABLE;
 
     // Even when this is a reconnect, previous nle->handle has already been
     // set to NULL (and the memory has or will be freed in uvHandleClosedCb),
@@ -303,7 +345,7 @@ uvAsyncCb(uv_async_t *handle)
         {
             case NATS_LIBUV_ATTACH:
             {
-                s = uvAsyncAttach(nle);
+                s = uvAsyncAttach(nle, event->socket);
                 break;
             }
             case NATS_LIBUV_READ:
@@ -404,13 +446,12 @@ natsLibuv_Attach(void **userData, void *loop, natsConnection *nc, natsSock socke
 
     if (s == NATS_OK)
     {
-        nle->socket = socket;
-        nle->events = UV_READABLE;
-
-        if (sched)
-            s = uvScheduleToEventLoop(nle, NATS_LIBUV_ATTACH, true);
+        // See comment in natsLibuvRead. Ordering matters here too: a pending
+        // removal must reach uvPollUpdate before this socket is installed.
+        if (sched || (nle->head != NULL))
+            s = uvScheduleAttachToEventLoop(nle, socket);
         else
-            s = uvAsyncAttach(nle);
+            s = uvAsyncAttach(nle, socket);
     }
 
     if (s == NATS_OK)
