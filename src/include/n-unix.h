@@ -18,12 +18,13 @@
 #define _GNU_SOURCE
 #endif
 
-#if defined(__arm__) || defined(__aarch64__)
+#if defined(__arm__) || defined(__aarch64__) || defined(__FreeBSD__)
 #include <sys/socket.h>
 #endif
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #include <sys/time.h>
 #include <fcntl.h>
