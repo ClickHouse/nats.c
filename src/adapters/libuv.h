@@ -187,6 +187,14 @@ uvPollUpdate(natsLibuvEvents *nle, int eventType, bool add)
             nle->events &= ~UV_WRITABLE;
     }
 
+    // The poll handle is released as soon as both events have been removed, and further
+    // events can still be delivered for it: the library asks to stop polling once per
+    // reconnect attempt and once more when it gives up and closes the connection, and the
+    // removals of the read and of the write event are two separate events. There is nothing
+    // left to poll on or to close, so both calls below would dereference a NULL handle.
+    if (nle->handle == NULL)
+        return NATS_OK;
+
     if (nle->events)
     {
         int res = uv_poll_start(nle->handle, nle->events, natsLibuvPoll);

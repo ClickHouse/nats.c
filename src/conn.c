@@ -2590,8 +2590,13 @@ _close(natsConnection *nc, natsConnStatus status, bool fromPublicClose, bool doC
         // one doing it.
         if (ttj.readLoop == NULL)
         {
-            // If event loop attached, stop polling...
-            if (nc->el.attached)
+            // If event loop attached and still polling, stop polling...
+            // `_evStopPolling()` has already run for a connection which was reconnecting,
+            // and it leaves the actual socket close to the event loop adapter, which has
+            // released its handle by then. Asking a second time would leave the socket of
+            // the last reconnect attempt open forever, because the adapter only knows the
+            // socket it was given when it was attached.
+            if (nc->el.attached && nc->sockCtx.useEventLoop)
             {
                 // This will take care of invalidating the socket and clear SSL,
                 // but the actual socket close will be done from the event loop
