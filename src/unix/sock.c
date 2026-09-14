@@ -48,10 +48,21 @@ natsSock_WaitReady(int waitMode, natsSockCtx *ctx)
             abort();
     }
 
-    if (deadline != NULL)
-        timeout = natsDeadline_GetTimeout(deadline);
+    for (;;)
+    {
+        if (deadline != NULL)
+            timeout = natsDeadline_GetTimeout(deadline);
 
-    res = poll(&pfd, 1, timeout);
+        res = poll(&pfd, 1, timeout);
+
+        // poll() is not restarted after a signal handler runs, so EINTR says nothing
+        // about the socket. Continue the wait with what is left of the deadline.
+        if ((res == NATS_SOCK_ERROR) && (NATS_SOCK_GET_ERROR == EINTR))
+            continue;
+
+        break;
+    }
+
     if (res == NATS_SOCK_ERROR)
         return nats_setError(NATS_IO_ERROR, "poll error: %d", NATS_SOCK_GET_ERROR);
     else if (res == 0)
