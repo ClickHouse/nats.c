@@ -48,10 +48,18 @@ natsSock_WaitReady(int waitMode, natsSockCtx *ctx)
             abort();
     }
 
-    if (deadline != NULL)
-        timeout = natsDeadline_GetTimeout(deadline);
+    do
+    {
+        if (deadline != NULL)
+            timeout = natsDeadline_GetTimeout(deadline);
 
-    res = poll(&pfd, 1, timeout);
+        res = poll(&pfd, 1, timeout);
+    }
+    // A signal delivered to the thread (e.g. the sampling profiler of the host
+    // application) interrupts poll() with EINTR. That is not a socket error:
+    // wait again for whatever is left of the deadline.
+    while ((res == NATS_SOCK_ERROR) && (NATS_SOCK_GET_ERROR == EINTR));
+
     if (res == NATS_SOCK_ERROR)
         return nats_setError(NATS_IO_ERROR, "poll error: %d", NATS_SOCK_GET_ERROR);
     else if (res == 0)
