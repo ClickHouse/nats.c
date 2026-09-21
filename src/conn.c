@@ -2214,6 +2214,10 @@ _processOpError(natsConnection *nc, natsStatus s, bool initialConnect)
             // but the actual socket close will be done from the event loop
             // adapter by calling natsConnection_ProcessCloseEvent().
             ls = _evStopPolling(nc);
+
+            // The blocking-IO reader destroys the parser once per socket at _readLoop's exit;
+            // an attached event loop has no such per-socket boundary, so mark it here.
+            nc->psReset = true;
         }
 
         // Fail pending flush requests.
@@ -4108,6 +4112,15 @@ natsConnection_ProcessReadEvent(natsConnection *nc)
     {
         natsConn_Unlock(nc);
         return;
+    }
+
+    // Same event-loop thread runs both this destroy and natsParser_Parse below,
+    // so the in-flight Parse on the previous socket has already returned.
+    if (nc->psReset)
+    {
+        natsParser_Destroy(nc->ps);
+        nc->ps = NULL;
+        nc->psReset = false;
     }
 
     if (nc->ps == NULL)

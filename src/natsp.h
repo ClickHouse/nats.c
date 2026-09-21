@@ -708,6 +708,7 @@ struct __natsConnection
     char                errStr[256];
 
     natsParser          *ps;
+    bool                psReset; // external event loop: destroy nc->ps on next ProcessReadEvent
     natsTimer           *ptmr;
     int                 pout;
 
