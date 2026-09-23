@@ -58,6 +58,8 @@ typedef struct
     uv_mutex_t      *lock;
     natsLibuvEvent  *head;
     natsLibuvEvent  *tail;
+    // This object owns the reference the library takes on `nc` at the first attach.
+    bool            releaseConnOnFree;
 
 } natsLibuvEvents;
 
@@ -262,7 +264,9 @@ uvAsyncAttach(natsLibuvEvents *nle, natsSock socket)
     // Even when this is a reconnect, previous nle->handle has already been
     // set to NULL (and the memory has or will be freed in uvHandleClosedCb),
     // so recreate now.
-    nle->handle = (uv_poll_t*) malloc(sizeof(uv_poll_t));
+    // Zero-initialized so that `type` stays UV_UNKNOWN_HANDLE until uv_poll_init
+    // links the handle into the loop, which is what the teardown below asks.
+    nle->handle = (uv_poll_t*) calloc(1, sizeof(uv_poll_t));
     if (nle->handle == NULL)
         s = NATS_NO_MEMORY;
 
@@ -283,13 +287,25 @@ uvAsyncAttach(natsLibuvEvents *nle, natsSock socket)
         s = NATS_ERR;
     }
 
+    if ((s != NATS_OK) && (nle->handle != NULL))
+    {
+        // uv_poll_init sets `type` and links the handle in one step but can fail on either
+        // side of it, so `type` is the exact witness: what the loop never saw is freed, what
+        // it linked is closed, which is safe mid-init while no poll request is submitted.
+        if (nle->handle->type == UV_UNKNOWN_HANDLE)
+            free(nle->handle);
+        else
+            uv_close((uv_handle_t*) nle->handle, uvHandleClosedCb);
+
+        nle->handle = NULL;
+    }
+
     return s;
 }
 
 static void
-uvFinalCloseCb(uv_handle_t* handle)
+natsLibuvEvents_free(natsLibuvEvents *nle, bool releaseConn)
 {
-    natsLibuvEvents *nle = (natsLibuvEvents*) handle->data;
     natsLibuvEvent  *event;
 
     while ((event = nle->head) != NULL)
@@ -298,14 +314,38 @@ uvFinalCloseCb(uv_handle_t* handle)
         free(event);
     }
     free(nle->scheduler);
-    uv_mutex_destroy(nle->lock);
-    free(nle->lock);
+    if (nle->lock != NULL)
+    {
+        uv_mutex_destroy(nle->lock);
+        free(nle->lock);
+    }
+    // Reads nle->nc, so it has to happen before the free below.
+    if (releaseConn)
+        natsConnection_ProcessDetachedEvent(nle->nc);
     free(nle);
+}
+
+static void
+uvFinalCloseCb(uv_handle_t* handle)
+{
+    natsLibuvEvents *nle = (natsLibuvEvents*) handle->data;
+
+    natsLibuvEvents_free(nle, nle->releaseConnOnFree);
 }
 
 static void
 uvAsyncDetach(natsLibuvEvents *nle)
 {
+    // The library asks to stop polling before it detaches, but that request can fail
+    // to reach this loop and its failure is not propagated, so a handle still armed
+    // here is this adapter's to close: the free below invalidates the `nle` that
+    // handle's `data` points at.
+    if (nle->handle != NULL)
+    {
+        uv_close((uv_handle_t*) nle->handle, uvHandleClosedCb);
+        nle->handle = NULL;
+    }
+
     uv_close((uv_handle_t*) nle->scheduler, uvFinalCloseCb);
 }
 
@@ -396,6 +436,8 @@ natsLibuv_Attach(void **userData, void *loop, natsConnection *nc, natsSock socke
     bool            sched   = false;
     natsLibuvEvents *nle    = (natsLibuvEvents*) (*userData);
     natsStatus      s       = NATS_OK;
+    bool            created = false;
+    bool            schedulerInitialized = false;
 
     sched = ((uv_key_get(&uvLoopThreadKey) != loop) ? true : false);
 
@@ -410,12 +452,21 @@ natsLibuv_Attach(void **userData, void *loop, natsConnection *nc, natsSock socke
         if (nle == NULL)
             return NATS_NO_MEMORY;
 
+        // Indicate that we have created the object here (in case we get a failure).
+        created = true;
+
         nle->lock = (uv_mutex_t*) malloc(sizeof(uv_mutex_t));
         if (nle->lock == NULL)
             s = NATS_NO_MEMORY;
 
         if ((s == NATS_OK) && (uv_mutex_init(nle->lock) != 0))
+        {
+            // A non-NULL nle->lock has to mean an initialized mutex:
+            // uv_mutex_destroy aborts on one that was never initialized.
+            free(nle->lock);
+            nle->lock = NULL;
             s = NATS_ERR;
+        }
 
         if ((s == NATS_OK)
             && ((nle->scheduler = (uv_async_t*) malloc(sizeof(uv_async_t))) == NULL))
@@ -423,17 +474,23 @@ natsLibuv_Attach(void **userData, void *loop, natsConnection *nc, natsSock socke
             s = NATS_NO_MEMORY;
         }
 
-        if ((s == NATS_OK)
-            && (uv_async_init(uvLoop, nle->scheduler, uvAsyncCb) != 0))
+        if (s == NATS_OK)
         {
-            s = NATS_ERR;
+            if (uv_async_init(uvLoop, nle->scheduler, uvAsyncCb) != 0)
+                s = NATS_ERR;
+            else
+            {
+                // uv_async_init links the handle into the loop's handle and async
+                // queues, so from here on it has to be closed, not freed.
+                schedulerInitialized = true;
+                nle->scheduler->data = (void*) nle;
+            }
         }
 
         if (s == NATS_OK)
         {
-            nle->nc              = nc;
-            nle->loop            = uvLoop;
-            nle->scheduler->data = (void*) nle;
+            nle->nc   = nc;
+            nle->loop = uvLoop;
         }
     }
 
@@ -448,9 +505,23 @@ natsLibuv_Attach(void **userData, void *loop, natsConnection *nc, natsSock socke
     }
 
     if (s == NATS_OK)
+    {
+        // Gated on a first attach, which cannot run off the loop thread, so this
+        // field is written and read (uvFinalCloseCb) on that thread only.
+        if (created)
+            nle->releaseConnOnFree = true;
+
         *userData = (void*) nle;
-    else
-        natsLibuv_Detach((void*) nle);
+    }
+    else if (created)
+    {
+        // A failure on a successive attach must leave `nle` untouched: the library
+        // keeps it in nc->el.data and reuses it on the next reconnect attempt.
+        if (schedulerInitialized)
+            uv_close((uv_handle_t*) nle->scheduler, uvFinalCloseCb);
+        else
+            natsLibuvEvents_free(nle, false);
+    }
 
     return s;
 }

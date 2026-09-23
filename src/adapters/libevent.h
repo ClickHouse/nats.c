@@ -32,6 +32,8 @@ typedef struct
     struct event        *read;
     struct event        *write;
     struct event        *keepActive;
+    // This object owns the reference the library takes on `nc` at the first attach.
+    bool                releaseConnOnFree;
 
 } natsLibeventEvents;
 
@@ -100,6 +102,7 @@ natsLibevent_Attach(void **userData, void *loop, natsConnection *nc, natsSock so
     struct event_base   *libeventLoop = (struct event_base*) loop;
     natsLibeventEvents  *nle          = (natsLibeventEvents*) (*userData);
     natsStatus          s             = NATS_OK;
+    bool                created       = false;
 
     // This is the first attach (when reconnecting, nle will be non-NULL).
     if (nle == NULL)
@@ -108,6 +111,8 @@ natsLibevent_Attach(void **userData, void *loop, natsConnection *nc, natsSock so
         if (nle == NULL)
             return NATS_NO_MEMORY;
 
+        // Indicate that we have created the object here (in case we get a failure).
+        created   = true;
         nle->nc   = nc;
         nle->loop = libeventLoop;
 
@@ -151,9 +156,19 @@ natsLibevent_Attach(void **userData, void *loop, natsConnection *nc, natsSock so
     }
 
     if (s == NATS_OK)
+    {
+        // The library retains only at a first attach, so only a first attach owns it.
+        if (created)
+            nle->releaseConnOnFree = true;
+
         *userData = (void*) nle;
-    else
+    }
+    else if (created)
+    {
+        // A failure on a successive attach must leave `nle` untouched: the library
+        // keeps it in nc->el.data and reuses it on the next reconnect attempt.
         natsLibevent_Detach((void*) nle);
+    }
 
     return s;
 }
@@ -244,6 +259,10 @@ natsLibevent_Detach(void *userData)
         event_active(nle->keepActive, 0, 0);
         event_free(nle->keepActive);
     }
+
+    // Reads nle->nc, so it has to happen before the free below.
+    if (nle->releaseConnOnFree)
+        natsConnection_ProcessDetachedEvent(nle->nc);
 
     free(nle);
 
