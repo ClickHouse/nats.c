@@ -20257,6 +20257,27 @@ _evLoopWrite(void *userData, bool add)
 static natsStatus
 _evLoopDetach(void *userData)
 {
+    struct threadArg    *arg = (struct threadArg *) userData;
+    natsConnection      *nc  = NULL;
+
+    natsMutex_Lock(arg->m);
+    nc = arg->nc;
+    natsMutex_Unlock(arg->m);
+    natsConnection_Destroy(nc);
+
+    natsMutex_Lock(arg->m);
+    arg->detached++;
+    natsCondition_Broadcast(arg->c);
+    natsMutex_Unlock(arg->m);
+
+    return NATS_OK;
+}
+
+// Same as _evLoopDetach, but leaves the release to the test, which is what lets
+// it observe the connection after the user has destroyed it.
+static natsStatus
+_evLoopDetachNoRelease(void *userData)
+{
     struct threadArg *arg = (struct threadArg *) userData;
 
     natsMutex_Lock(arg->m);
@@ -20341,6 +20362,8 @@ void test_EventLoop(void)
     IFOK(s, natsOptions_SetReconnectedCB(opts, _reconnectedCb, (void*) &arg));
     IFOK(s, natsOptions_SetClosedCB(opts, _closedCb, (void*) &arg));
     testCond(s == NATS_OK);
+
+    arg.nc = nc;
 
     pid = _startServer("nats://127.0.0.1:4222", NULL, true);
     CHECK_SERVER_STARTED(pid);
@@ -20542,6 +20565,8 @@ void test_EventLoopParserResetOnDisconnect(void)
     IFOK(s, natsOptions_SetClosedCB(opts, _closedCb, (void*) &arg));
     testCond(s == NATS_OK);
 
+    arg.nc = nc;
+
     test("Start mockup server: ");
     if (s == NATS_OK)
     {
@@ -20624,6 +20649,177 @@ void test_EventLoopParserResetOnDisconnect(void)
     _destroyDefaultThreadArgs(&arg);
 }
 
+static void
+_evLoopKeepOpenMockupServerThread(void *closure)
+{
+    natsStatus          s     = NATS_OK;
+    natsSock            sock  = NATS_SOCK_INVALID;
+    struct threadArg    *arg  = (struct threadArg*) closure;
+    natsSockCtx         ctx;
+    char                buffer[1024];
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fd = NATS_SOCK_INVALID;
+
+    s = _startMockupServer(&sock, "localhost", "4222");
+    natsMutex_Lock(arg->m);
+    arg->status = s;
+    natsCondition_Signal(arg->c);
+    natsMutex_Unlock(arg->m);
+
+    if ((s == NATS_OK)
+            && (((ctx.fd = accept(sock, NULL, NULL)) == NATS_SOCK_INVALID)
+                || (natsSock_SetCommonTcpOptions(ctx.fd) != NATS_OK)))
+    {
+        s = NATS_SYS_ERROR;
+    }
+
+    if (s == NATS_OK)
+    {
+        s = natsSock_WriteFully(&ctx, arg->string, (int) strlen(arg->string));
+        // natsSock_ReadLine keeps the bytes after the line it returns, so the
+        // buffer is cleared once, before the first read.
+        buffer[0] = '\0';
+        // CONNECT, then PING.
+        IFOK(s, natsSock_ReadLine(&ctx, buffer, sizeof(buffer)));
+        IFOK(s, natsSock_ReadLine(&ctx, buffer, sizeof(buffer)));
+        IFOK(s, natsSock_WriteFully(&ctx, _PONG_PROTO_, _PONG_PROTO_LEN_));
+    }
+
+    // The handshake above is served by blocking reads inside the connect call, so
+    // a PING is what forces at least one read event through the event loop.
+    if (s == NATS_OK)
+    {
+        s = natsSock_WriteFully(&ctx, _PING_PROTO_, _PING_PROTO_LEN_);
+        IFOK(s, natsSock_ReadLine(&ctx, buffer, sizeof(buffer)));
+        if ((s == NATS_OK) && (strncmp(buffer, "PONG", 4) == 0))
+        {
+            natsMutex_Lock(arg->m);
+            arg->msgReceived = true;
+            natsCondition_Broadcast(arg->c);
+            natsMutex_Unlock(arg->m);
+        }
+    }
+
+    natsMutex_Lock(arg->m);
+    while ((s != NATS_TIMEOUT) && !(arg->done))
+        s = natsCondition_TimedWait(arg->c, arg->m, 10000);
+    natsMutex_Unlock(arg->m);
+
+    natsSock_Close(ctx.fd);
+    natsSock_Close(sock);
+}
+
+void test_EventLoopDestroyWhileAttached(void)
+{
+    natsStatus          s;
+    natsConnection      *nc         = NULL;
+    natsOptions         *opts       = NULL;
+    natsThread          *t          = NULL;
+    struct threadArg    arg;
+    struct threadArg    sarg;
+
+    test("Set options: ");
+    s = _createDefaultThreadArgsForCbTests(&arg);
+    IFOK(s, _createDefaultThreadArgsForCbTests(&sarg));
+    IFOK(s, natsOptions_Create(&opts));
+    IFOK(s, natsOptions_SetURL(opts, "nats://localhost:4222"));
+    IFOK(s, natsOptions_SetEventLoop(opts, (void*) &arg,
+                                     _evLoopAttach,
+                                     _evLoopRead,
+                                     _evLoopWrite,
+                                     _evLoopDetachNoRelease));
+    testCond(s == NATS_OK);
+
+    arg.nc = nc;
+
+    test("Start mockup server: ");
+    if (s == NATS_OK)
+    {
+        // Set to error, the mockup server thread sets it to OK once listening.
+        sarg.status = NATS_ERR;
+        sarg.string = "INFO {\"server_id\":\"22\",\"version\":\"latest\",\"go\":\"latest\",\"port\":4222,\"max_payload\":1048576}\r\n";
+        s = natsThread_Create(&t, _evLoopKeepOpenMockupServerThread, (void*) &sarg);
+    }
+    if (s == NATS_OK)
+    {
+        natsMutex_Lock(sarg.m);
+        while ((s != NATS_TIMEOUT) && (sarg.status != NATS_OK))
+            s = natsCondition_TimedWait(sarg.c, sarg.m, 2000);
+        IFOK(s, sarg.status);
+        natsMutex_Unlock(sarg.m);
+    }
+    testCond(s == NATS_OK);
+
+    test("Start event loop: ");
+    natsMutex_Lock(arg.m);
+    arg.sock = NATS_SOCK_INVALID;
+    natsMutex_Unlock(arg.m);
+    s = natsThread_Create(&arg.t, _eventLoop, (void*) &arg);
+    testCond(s == NATS_OK);
+
+    test("Connect and attach: ");
+    s = natsConnection_Connect(&nc, opts);
+    if (s == NATS_OK)
+    {
+        natsMutex_Lock(arg.m);
+        while ((s != NATS_TIMEOUT) && (arg.attached == 0))
+            s = natsCondition_TimedWait(arg.c, arg.m, 2000);
+        natsMutex_Unlock(arg.m);
+    }
+    testCond((s == NATS_OK) && (nc != NULL));
+
+    // Positive control: without a read event having gone through the event loop,
+    // the checks below would pass for the wrong reason.
+    test("A read event went through the event loop: ");
+    natsMutex_Lock(sarg.m);
+    while ((s != NATS_TIMEOUT) && !sarg.msgReceived)
+        s = natsCondition_TimedWait(sarg.c, sarg.m, 5000);
+    natsMutex_Unlock(sarg.m);
+    testCond(s == NATS_OK);
+
+    test("Destroy the connection while still attached: ");
+    natsConnection_Destroy(nc);
+    natsMutex_Lock(arg.m);
+    while ((s != NATS_TIMEOUT) && (arg.detached == 0))
+        s = natsCondition_TimedWait(arg.c, arg.m, 5000);
+    natsMutex_Unlock(arg.m);
+    testCondNoReturn(s == NATS_OK);
+
+    natsMutex_Lock(arg.m);
+    arg.done = true;
+    natsCondition_Broadcast(arg.c);
+    natsMutex_Unlock(arg.m);
+    natsThread_Join(arg.t);
+    natsThread_Destroy(arg.t);
+    arg.t = NULL;
+
+    // The event loop can still deliver an event for a socket whose removal it has
+    // not processed yet. The library's own reference, taken at the first attach
+    // and released by the adapter below, is what keeps that from being a
+    // use-after-free on `nc`.
+    test("A late event after the destroy is a no-op: ");
+    natsConnection_ProcessReadEvent(nc);
+    natsConnection_ProcessWriteEvent(nc);
+    testCondNoReturn(natsConnection_Status(nc) == NATS_CONN_STATUS_CLOSED);
+
+    test("The adapter releases on detach: ");
+    natsConnection_ProcessDetachedEvent(nc);
+    testCondNoReturn(true);
+
+    natsMutex_Lock(sarg.m);
+    sarg.done = true;
+    natsCondition_Broadcast(sarg.c);
+    natsMutex_Unlock(sarg.m);
+    natsThread_Join(t);
+    natsThread_Destroy(t);
+
+    natsOptions_Destroy(opts);
+
+    _destroyDefaultThreadArgs(&sarg);
+    _destroyDefaultThreadArgs(&arg);
+}
+
 void test_EventLoopRetryOnFailedConnect(void)
 {
     natsStatus          s;
@@ -20650,6 +20846,8 @@ void test_EventLoopRetryOnFailedConnect(void)
                                      _evLoopWrite,
                                      _evLoopDetach));
     testCond(s == NATS_OK);
+
+    arg.nc = nc;
 
     test("Start event loop: ");
     natsMutex_Lock(arg.m);
@@ -20737,6 +20935,8 @@ void test_EventLoopTLS(void)
                                      _evLoopWrite,
                                      _evLoopDetach));
     testCond(s == NATS_OK);
+
+    arg.nc = nc;
 
     test("Start server: ");
     pid = _startServer("nats://127.0.0.1:4443", "-config tls.conf", true);
