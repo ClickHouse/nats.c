@@ -485,11 +485,15 @@ natsLibuv_Read(void *userData, bool add)
     natsStatus      s    = NATS_OK;
     bool            sched;
 
-    // If we remove, first stop polling immediately, then proceed as usual.
-    if (!add)
-        uv_poll_stop(nle->handle);
-
     sched = ((uv_key_get(&uvLoopThreadKey) != nle->loop) ? true : false);
+
+    // If we remove, first stop polling immediately, then proceed as usual.
+    // Libuv is not thread-safe, so this is only done from the event loop
+    // thread: from any other thread, `nle->handle` belongs to the running
+    // loop and the poll is stopped by the scheduled removal instead. The
+    // handle is also already released if both events have been removed.
+    if (!add && !sched && (nle->handle != NULL))
+        uv_poll_stop(nle->handle);
 
     // If this call is made from a different thread than the event loop's
     // thread, or if there are already scheduled events, then schedule
