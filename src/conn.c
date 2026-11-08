@@ -3458,10 +3458,17 @@ natsConn_subscribeImpl(natsSubscription **newSub,
 
             natsConn_removeSubscription(nc, sub);
 
+            // The subscription owns the reference to the connection retained
+            // before calling `natsSub_create`, so this releases it as well
+            // (possibly later, from the delivery thread).
             natsSub_release(sub);
         }
-        // Compensate for the `_retain()` done before calling `natsSub_create`.
-        _release(nc);
+        else
+        {
+            // `natsSub_create` failed and left the reference with us:
+            // compensate for the `_retain()` done before calling it.
+            _release(nc);
+        }
     }
 
     if (lock)

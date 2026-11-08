@@ -350,6 +350,10 @@ natsSub_create(natsSubscription **newSub, natsConnection *nc, const char *subj,
     natsStatus s = NATS_OK;
     natsSubscription *sub = NULL;
 
+    // The caller retains the connection (with its lock held) before calling
+    // this function. On success, the subscription takes over this reference
+    // and releases it when freed. On failure, the reference stays with the
+    // caller, which must release it.
     sub = (natsSubscription *)NATS_CALLOC(1, sizeof(natsSubscription));
     if (sub == NULL)
         return nats_setDefaultError(NATS_NO_MEMORY);
@@ -422,9 +426,17 @@ natsSub_create(natsSubscription **newSub, natsConnection *nc, const char *subj,
     }
 
     if (s == NATS_OK)
+    {
         *newSub = sub;
+    }
     else
+    {
+        // On failure, the caller keeps its reference to the connection, but
+        // releasing the subscription releases `sub->conn`: compensate for it.
+        // The connection lock is held by the caller.
+        natsConn_retainLocked(nc);
         natsSub_release(sub);
+    }
 
     return NATS_UPDATE_ERR_STACK(s);
 }
