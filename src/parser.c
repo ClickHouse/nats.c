@@ -934,6 +934,9 @@ natsParser_Destroy(natsParser *parser)
     natsBuf_Cleanup(&(parser->ma.subjectRec));
     natsBuf_Cleanup(&(parser->ma.replyRec));
     natsBuf_Cleanup(&(parser->argBufRec));
+    // A split payload that does not fit in the scratch buffer has its own allocation.
+    if (parser->msgBuf != &(parser->msgBufRec))
+        natsBuf_Destroy(parser->msgBuf);
     natsBuf_Cleanup(&(parser->msgBufRec));
 
     NATS_FREE(parser);
